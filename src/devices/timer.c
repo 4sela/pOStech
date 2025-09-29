@@ -99,7 +99,7 @@ timer_sleep (int64_t ticks)
   ASSERT (intr_get_level () == INTR_ON);
   enum intr_level old_level = intr_disable();
 
-  cur->wakeup_tick = wakeup;
+  cur->wakeup_ticks = wakeup;
   list_insert_ordered(&sleep_list, &cur->sleep_elem,
                       (list_less_func *) thread_wakeup_less, NULL);
   thread_block();
@@ -114,7 +114,7 @@ thread_wakeup_less(const struct list_elem *a,
 {
   struct thread *t_a = list_entry(a, struct thread, sleep_elem);
   struct thread *t_b = list_entry(b, struct thread, sleep_elem);
-  return t_a->wakeup_tick < t_b->wakeup_tick;
+  return t_a->wakeup_ticks < t_b->wakeup_ticks;
 }
 
 /* Sleeps for approximately MS milliseconds.  Interrupts must be
@@ -196,7 +196,7 @@ timer_interrupt (struct intr_frame *args UNUSED)
   while (!list_empty(&sleep_list)) {
     struct thread *t = list_entry(list_front(&sleep_list),
                                   struct thread, sleep_elem);
-    if (t->wakeup_tick > ticks)
+    if (t->wakeup_ticks > ticks)
       break;
 
     list_pop_front(&sleep_list);
