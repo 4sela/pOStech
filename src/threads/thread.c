@@ -11,6 +11,7 @@
 #include "threads/switch.h"
 #include "threads/synch.h"
 #include "threads/vaddr.h"
+#include "devices/timer.h"
 #ifdef USERPROG
 #include "userprog/process.h"
 #endif
@@ -19,6 +20,16 @@
    Used to detect stack overflow.  See the big comment at the top
    of thread.h for details. */
 #define THREAD_MAGIC 0xcd6abf4b
+
+/* Fixed-point arithmetic using 17.14 format (17 int bits, 14 frac bits) */
+#define FP_SHIFT 14
+#define INT_TO_FP(n) ((n) << FP_SHIFT)
+#define FP_TO_INT_ZERO(x) ((x) >> FP_SHIFT)
+#define FP_TO_INT_NEAREST(x) (((x) >= 0) ? (((x) + (1 << (FP_SHIFT - 1))) >> FP_SHIFT) : (((x) - (1 << (FP_SHIFT - 1))) >> FP_SHIFT))
+#define FP_ADD(x, y) ((x) + (y))
+#define FP_SUB(x, y) ((x) - (y))
+#define FP_MUL(x, y) (((int64_t)(x) * (y)) >> FP_SHIFT)
+#define FP_DIV(x, y) (((int64_t)(x) << FP_SHIFT) / (y))
 
 /* List of processes in THREAD_READY state, that is, processes
    that are ready to run but not actually running. */
@@ -49,6 +60,7 @@ struct kernel_thread_frame
 static long long idle_ticks;    /* # of timer ticks spent idle. */
 static long long kernel_ticks;  /* # of timer ticks in kernel threads. */
 static long long user_ticks;    /* # of timer ticks in user programs. */
+int load_avg;                   /* System load average for MLFQS */
 
 /* Scheduling. */
 #define TIME_SLICE 4            /* # of timer ticks to give each thread. */
@@ -114,6 +126,46 @@ void thread_start (void) {
   sema_down (&idle_started);
 }
 
+/* Update a thread's priority based on MLFQS formula */
+void mlfqs_update_priority(struct thread *t) {
+  if (t == idle_thread) return;
+
+  int new_priority = FP_TO_INT_NEAREST(INT_TO_FP(PRI_MAX) - FP_DIV(t->recent_cpu, 4) - INT_TO_FP(t->nice * 2));
+  if (new_priority > PRI_MAX) new_priority = PRI_MAX;
+  if (new_priority < PRI_MIN) new_priority = PRI_MIN;
+
+  t->priority = new_priority;
+}
+
+/* Increments the recent_cpu value for the current thread. */
+void mlfqs_increment_recent_cpu(void) {
+    if (thread_current() != idle_thread) {
+      thread_current()->recent_cpu = FP_ADD(thread_current()->recent_cpu, INT_TO_FP(1));
+    }
+}
+
+/* Recalculates the recent_cpu value for all threads. */
+void mlfqs_recalculate_recent_cpu_all(void) {
+  int ready_threads = list_size(&ready_list);
+  if (thread_current() != idle_thread)
+      ready_threads += 1;
+
+  /* load_avg = (59/60)*load_avg + (1/60)*ready_threads */
+  load_avg = FP_DIV(FP_MUL(INT_TO_FP(59), load_avg) + FP_MUL(INT_TO_FP(ready_threads), INT_TO_FP(1)), 60);
+
+  struct list_elem *e;
+  for (e = list_begin(&all_list); e != list_end(&all_list); e = list_next(e)) {
+    struct thread *t = list_entry(e, struct thread, allelem);
+      if (t != idle_thread) {
+        /* recent_cpu = (2*load_avg)/(2*load_avg + 1) * recent_cpu + nice */
+        int load_mul_2 = FP_MUL(INT_TO_FP(2), load_avg);
+        t->recent_cpu = FP_ADD(FP_MUL(FP_DIV(load_mul_2, FP_ADD(load_mul_2, INT_TO_FP(1))), t->recent_cpu),
+                                   INT_TO_FP(t->nice));
+        mlfqs_update_priority(t);
+      }
+  }
+}
+
 /* Called by the timer interrupt handler at each timer tick.
    Thus, this function runs in an external interrupt context. */
 void thread_tick (void) {
@@ -129,6 +181,18 @@ void thread_tick (void) {
   else
     kernel_ticks++;
 
+  if (thread_mlfqs) {      
+    if (t != idle_thread)
+      t->recent_cpu = FP_ADD(t->recent_cpu, INT_TO_FP(1));
+
+    if (timer_ticks() % 4 == 0)
+      mlfqs_update_priority(t);
+
+    if (timer_ticks() % TIMER_FREQ == 0)
+      mlfqs_recalculate_recent_cpu_all();
+  }
+
+  /* Check for preemption (time slice) */
   bool do_yield = false;  
   if (++thread_ticks >= TIME_SLICE)  
     do_yield = true;            
@@ -328,8 +392,8 @@ thread_yield (void)
   ASSERT (!intr_context ());
 
   old_level = intr_disable ();
-  if (cur != idle_thread) 
-    list_push_back (&ready_list, &cur->ready_elem);
+  if (cur != idle_thread)
+    list_insert_ordered(&ready_list, &cur->ready_elem, priority_less_func, NULL);
   cur->status = THREAD_READY;
   schedule ();
   intr_set_level (old_level);
@@ -353,15 +417,24 @@ thread_foreach (thread_action_func *func, void *aux)
 }
 
 /* Sets the current thread's priority to NEW_PRIORITY. */
-void
-thread_set_priority (int new_priority) 
-{
-  thread_current ()->priority = new_priority;
-  if (thread_current ()->status == THREAD_READY) {
-    list_remove (&thread_current ()->ready_elem);
-    list_insert_ordered (&ready_list, &thread_current ()->ready_elem, priority_less_func, NULL);
+void 
+thread_set_priority(int new_priority) {
+  struct thread *cur = thread_current();
+  cur->priority = new_priority;
+
+  if (cur->status == THREAD_READY) {
+    list_remove(&cur->ready_elem);
+    list_insert_ordered(&ready_list, &cur->ready_elem, priority_less_func, NULL);
+  }
+  
+  if (!list_empty(&ready_list)) {
+    struct thread *next = list_entry(list_front(&ready_list), struct thread, ready_elem);
+    if (next->priority > cur->priority) {
+      thread_yield();
+    }
   }
 }
+
 
 /* Returns the current thread's priority. */
 int
@@ -374,31 +447,29 @@ thread_get_priority (void)
 void
 thread_set_nice (int nice UNUSED) 
 {
-  /* Not yet implemented. */
+  thread_current()->nice = nice;
+  mlfqs_update_priority(thread_current());
 }
 
 /* Returns the current thread's nice value. */
 int
 thread_get_nice (void) 
 {
-  /* Not yet implemented. */
-  return 0;
+  return thread_current()->nice;
 }
 
 /* Returns 100 times the system load average. */
 int
 thread_get_load_avg (void) 
 {
-  /* Not yet implemented. */
-  return 0;
+  return load_avg * 100;
 }
 
 /* Returns 100 times the current thread's recent_cpu value. */
 int
 thread_get_recent_cpu (void) 
 {
-  /* Not yet implemented. */
-  return 0;
+  return thread_current()->recent_cpu * 100;
 }
 
 /* Idle thread.  Executes when no other thread is ready to run.
@@ -488,6 +559,10 @@ init_thread (struct thread *t, const char *name, int priority)
   t->stack = (uint8_t *) t + PGSIZE;
   t->priority = priority;
   t->original_priority = priority;
+
+  t->recent_cpu = 0;
+  t->nice = 0;
+
   t->magic = THREAD_MAGIC;
 
   old_level = intr_disable ();

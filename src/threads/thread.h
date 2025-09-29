@@ -90,6 +90,8 @@ struct thread
     int priority;                       /* Priority. */
     int original_priority;              /* Original priority before donation */
     int wakeup_ticks;                   /* Tick to wake up thread */
+    int nice;                           /* Niceness value for MLFQS */
+    int recent_cpu;                     /* Recent CPU value for MLFQS */
     struct list donations;              /* List of threads that donated priority */
     struct lock *waiting_on_lock;       /* Lock that the thread is waiting for (if any) */
     struct list_elem allelem;           /* List element for all threads list. */
